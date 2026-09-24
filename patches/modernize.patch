@@ -1,0 +1,603 @@
+--- a/BlenderUmap/BlenderUmap.cs
++++ b/BlenderUmap/BlenderUmap.cs
+@@ -1,4 +1,4 @@
+-﻿using System;
++using System;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.Diagnostics;
+@@ -11,6 +11,10 @@
+ using BlenderUmap;
+ using BlenderUmap.Extensions;
+ using CUE4Parse.MappingsProvider;
++using CUE4Parse.MappingsProvider.Usmap;
++using CUE4Parse_Conversion.Dto;
++using CUE4Parse_Conversion.Options;
++using CUE4Parse_Conversion.Formats.Meshes;
+ using CUE4Parse.UE4.Assets;
+ using CUE4Parse.UE4.Assets.Exports;
+ using CUE4Parse.UE4.Assets.Exports.Material;
+@@ -27,7 +31,7 @@
+ using CUE4Parse_Conversion.Meshes;
+ using CUE4Parse_Conversion.Textures;
+ using CUE4Parse.UE4.Assets.Exports.Component.StaticMesh;
+-using CUE4Parse.UE4.Assets.Exports.Mesh;
++
+ using CUE4Parse.UE4.Assets.Exports.SkeletalMesh;
+ using CUE4Parse.UE4.Objects.Core.Serialization;
+ using Newtonsoft.Json;
+@@ -49,10 +53,21 @@
+         private static readonly bool NoExport = false;
+ #endif
+         public static uint ThreadWorkCount = 0;
++        public static int ExportFailures = 0;
+         private static readonly object TextureLock = new object();
+         private static readonly object MeshLock = new object();
+ 
+         public static void Main(string[] args) {
++            if (args.Length > 0 && args[0] == "--replay-info") {
++                if (args.Length < 2) { Console.Error.WriteLine("Usage: BlenderUmap --replay-info replay-file [report.json]"); Environment.ExitCode = 2; return; }
++                try { Environment.ExitCode = ModernReplayReader.Inspect(args[1], args.Length > 2 ? args[2] : null); }
++                catch (Exception error) { Console.Error.WriteLine(error); Environment.ExitCode = 1; }
++                return;
++            }
++            if (args.Length > 0 && args[0] == "--help") {
++                Console.WriteLine("BlenderUmap experimental modern build. Use --replay-info replay-file [report.json], or run without arguments using config.json. 42.20 support is not verified.");
++                return;
++            }
+             Log.Logger = new LoggerConfiguration()
+                 .MinimumLevel.Information()
+                 .WriteTo.File(Path.Combine("Logs", $"BlenderUmap-{DateTime.Now:yyyy-MM-dd}.log"))
+@@ -89,7 +104,7 @@
+                     customVersions.Add(new FCustomVersion(){ Key = new FGuid(t.Key), Version = t.Value });
+                 }
+ 
+-                provider = new MyFileProvider(paksDir, new VersionContainer(config.Game, optionOverrides: config.OptionsOverrides, customVersions: customVersions), config.EncryptionKeys, config.bDumpAssets, config.ObjectCacheSize);
++                provider = new MyFileProvider(paksDir, new VersionContainer(config.Game, optionOverrides: config.OptionsOverrides, customVersions: new FCustomVersionContainer(customVersions)), config.EncryptionKeys, config.bDumpAssets, config.ObjectCacheSize);
+                 provider.LoadVirtualPaths();
+                 
+                 var newestUsmap = GetNewestUsmap(new DirectoryInfo("mappings"));
+@@ -103,12 +118,13 @@
+                 var pkg = ExportAndProduceProcessed(config.ExportPackage, new List<string>());
+                 if (pkg == null) Environment.Exit(1); // prevent addon from importing previously exported maps
+ 
+-                while (ThreadWorkCount > 0) {
++                while (Volatile.Read(ref ThreadWorkCount) > 0) {
+                     Console.Write($"\rWaiting for {ThreadWorkCount} threads to exit...");
+                     Thread.Sleep(1000);
+                 }
+                 Console.WriteLine();
+ 
++                if (ExportFailures > 0) throw new MainException($"{ExportFailures} asset exports failed. Check the log before importing this partial export.");
+                 var file = new FileInfo("processed.json");
+                 Log.Information("Writing to {0}", file.FullName);
+                 using (var writer = file.CreateText()) {
+@@ -163,9 +179,9 @@
+ 
+             if (provider.TryLoadPackage(path, out var pkg)) { // multiple exports with package name
+                 if (pkg is Package notioPackage) {
+-                    foreach (var export in notioPackage.ExportMap) {
+-                        if (export.ClassName == "World") {
+-                            obj = export.ExportObject.Value;
++                    foreach (var export in ((IPackage)notioPackage).GetExports()) {
++                        if (export.ExportType == "World") {
++                            obj = export;
+                         }
+                     }
+                 }
+@@ -296,7 +312,7 @@
+             if (actor.TryGetValue(out bool bHidden, "bHidden", "bHiddenInGame") && bHidden && !config.bExportHiddenObjects)
+                 return;
+ 
+-            if (parentTransform == default) parentTransform = FTransform.Identity;
++            if (parentTransform.Equals(default(FTransform))) parentTransform = FTransform.Identity;
+             if (actor.TryGetValue(out FPackageIndex[] instanceComps, "InstanceComponents", "MergedMeshComponents", "BlueprintCreatedComponents")) {
+                 var root = actor.GetOrDefault<UObject>("RootComponent", new UObject());
+                 var relativeLocation = root.GetOrDefault<FVector>("RelativeLocation", FVector.ZeroVector);
+@@ -403,7 +419,7 @@
+             var mesh = staticMeshComp!.GetOrDefault("StaticMesh", staticMeshComp!.GetOrDefault<FPackageIndex>("SkeletalMesh")); // /Script/Engine.StaticMeshComponent:StaticMesh
+ 
+             if (mesh == null || mesh.IsNull) { // read the actor class to find the mesh
+-                var actorBlueprint = actor.Class;
++                var actorBlueprint = actor.Class?.Load<UBlueprintGeneratedClass>();
+ 
+                     if (actorBlueprint is UBlueprintGeneratedClass) {
+                         if (actorBlueprint.Owner != null)
+@@ -547,7 +563,8 @@
+             }
+ 
+             var localTransform = new FTransform(rot, loc, scale);
+-            var finalTransform = new FTransform(parentTransform.ToMatrixWithScale() * localTransform.ToMatrixWithScale());
++            var finalTransform = FTransform.Identity;
++            finalTransform.SetFromMatrix(parentTransform.ToMatrixWithScale() * localTransform.ToMatrixWithScale());
+ 
+             // identifiers
+             var comp = new JArray();
+@@ -565,7 +582,7 @@
+             comp.Add(children);
+ 
+             int lightIndex = 0;
+-            if (CheckIfHasLights(actor.Class.Outer?.Owner, out var lightinfo)) {
++            if (CheckIfHasLights(actor.Class?.Package, out var lightinfo)) {
+                 var infor = new LightInfo2() {
+                     Props = lightinfo.ToArray()
+                 };
+@@ -615,15 +632,16 @@
+             }
+ 
+             // char[] fourCC = config.bExportToDDSWhenPossible ? GetDDSFourCC(texture) : null;
++            Interlocked.Increment(ref ThreadWorkCount);
+             ThreadPool.QueueUserWorkItem(_ => {
+                 FileStream stream;
+                 lock (TextureLock) {
+-                    if (output.Exists) {
++                    if (output.Exists && output.Length > 0) {
++                        Interlocked.Decrement(ref ThreadWorkCount);
+                         Log.Debug("Texture already exists, skipping: {0}", output.FullName);
+                         return;
+                     }
+                     stream = output.OpenWrite();
+-                    Interlocked.Increment(ref ThreadWorkCount);
+                 }
+ 
+                 try {
+@@ -636,74 +654,63 @@
+                     }
+                     Log.Information("Saving texture to {0}", output.FullName);
+                     var firstMip = texture.GetFirstMip(); // Modify this if you want lower res textures
+-                    using var image = texture.Decode(firstMip);
+-                    using var data = image.Encode(SKEncodedImageFormat.Png, 100);
++                    var image = texture.Decode(firstMip) ?? throw new InvalidDataException("Texture decoder returned no pixels.");
++                    var data = image.Encode(ETextureFormat.Png, false, out var textureExtension, 100);
+                     stream.Write(data.AsSpan());
+                     stream.Close();
+                     Interlocked.Decrement(ref ThreadWorkCount);
+                 }
+-                catch (Exception e) { stream.Close(); Log.Warning(e, "Failed to save texture"); Interlocked.Decrement(ref ThreadWorkCount); }
++                catch (Exception e) { stream.Close(); output.Delete(); Interlocked.Increment(ref ExportFailures); Log.Warning(e, "Failed to save texture"); Interlocked.Decrement(ref ThreadWorkCount); }
+             });
+         }
+ 
+         public static void ExportMesh(FPackageIndex mesh, List<Mat> materials) {
+             if (NoExport || mesh == null || mesh.IsNull) return;
+             var exportObj = mesh.Load<UObject>();
+-            if (!(exportObj is IMesh meshExport) || meshExport == null) return;
++            if (exportObj is not UStaticMesh && exportObj is not USkeletalMesh) return;
++            var meshExport = exportObj;
+             var output = new FileInfo(Path.Combine(GetExportDir(exportObj).ToString(), exportObj.Name + ".pskx"));
+ 
++            Interlocked.Increment(ref ThreadWorkCount);
+             ThreadPool.QueueUserWorkItem(delegate {
+                 FileStream stream;
+                 lock (MeshLock) {
+-                    if (output.Exists) return;
+-                    Interlocked.Increment(ref ThreadWorkCount);
++                    if (output.Exists && output.Length > 0) { Interlocked.Decrement(ref ThreadWorkCount); return; }
+                     stream = output.OpenWrite();
+                 }
+ 
+                 try {
+-                    MeshExporter exporter;
++                    var options = new ExportOptions(meshFormat: EMeshFormat.ActorX, meshQuality: EMeshQuality.Highest, exportMaterials: false, socketFormat: ESocketFormat.None);
++                    var format = new ActorXMeshFormat();
++                    IReadOnlyList<ExportFile> meshFiles;
+                     if (meshExport is UStaticMesh staticMesh) {
+-                        exporter = new MeshExporter(staticMesh,
+-                            new ExporterOptions() { SocketFormat = ESocketFormat.None }, false);
+-                    }
+-                    else if (meshExport is USkeletalMesh skeletalMesh) {
+-                        exporter = new MeshExporter(skeletalMesh,
+-                            new ExporterOptions() { SocketFormat = ESocketFormat.None }, false);
+-                    }
+-                    else {
+-                        Log.Warning("Unknown mesh type: {0}", exportObj.ExportType);
+-                        stream.Close();
+-                        output.Delete();
+-                        Interlocked.Decrement(ref ThreadWorkCount);
+-                        return;
+-                    }
+-
++                        using var dto = new StaticMeshDto(staticMesh, options.MeshQuality, options.NaniteMeshFormat);
++                        meshFiles = format.BuildStaticMesh(exportObj.Name, exportObj.GetPathName(), options, dto);
++                    } else {
++                        using var dto = new SkeletalMeshDto((USkeletalMesh)meshExport, options.MeshQuality, options.NaniteMeshFormat);
++                        meshFiles = format.BuildSkeletalMesh(exportObj.Name, exportObj.GetPathName(), options, dto);
++                    }
++                    if (meshFiles.Count == 0) throw new InvalidDataException("Mesh has no LODs: " + exportObj.Name);
+                     Log.Information("Saving {0} to {1}", exportObj.ExportType, output.FullName);
+-                    if (exporter.MeshLods.Count == 0) {
+-                        Log.Warning("Mesh '{0}' has no LODs", exportObj.Name);
+-                        stream.Close();
+-                        output.Delete();
+-                        Interlocked.Decrement(ref ThreadWorkCount);
+-                        return;
+-                    }
+-
+-                    stream.Write(exporter.MeshLods.First().FileData);
++                    stream.Write(meshFiles[0].Data);
+                     stream.Close();
+                     Interlocked.Decrement(ref ThreadWorkCount);
+                 }
+                 catch (Exception e) {
+                     stream.Close();
++                    output.Delete();
++                    Interlocked.Increment(ref ExportFailures);
+                     Log.Warning(e, "Failed to save mesh");
+                     Interlocked.Decrement(ref ThreadWorkCount);
+                 }
+             });
+             
+             if (config.bReadMaterials) {
+-                var matObjs = meshExport.Materials;
++                var matObjs = meshExport is UStaticMesh sm ? sm.Materials : ((USkeletalMesh)meshExport).Materials;
+ 
+                 if (matObjs != null) {
+                     foreach (var material in matObjs) {
+-                        materials.Add(new Mat(material));
++                        materials.Add(new Mat(material?.ResolvedObject));
+                     }
+                 }
+             }
+@@ -922,7 +929,7 @@
+                             _scalarParameterValues.TryAdd(switchParameter.Name, switchParameter.Value ? 1 : 0);
+                         }
+                     if (mi.Parent != null) {
+-                        PopulateTextures(mi.Parent);
++                        PopulateTextures(mi.Parent.Load());
+                     }
+                 }
+             }
+--- a/BlenderUmap/BlenderUmap.csproj
++++ b/BlenderUmap/BlenderUmap.csproj
+@@ -2,16 +2,16 @@
+ 
+     <PropertyGroup>
+         <OutputType>Exe</OutputType>
+-        <TargetFramework>net6.0</TargetFramework>
++        <TargetFramework>net10.0</TargetFramework>
+         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+     </PropertyGroup>
+ 
+     <ItemGroup>
+-      <PackageReference Include="Newtonsoft.Json" Version="13.0.2" />
+-      <PackageReference Include="Serilog" Version="2.12.0" />
+-      <PackageReference Include="Serilog.Extensions.Logging" Version="3.1.1-dev-10301" />
+-      <PackageReference Include="Serilog.Sinks.File" Version="5.0.1-dev-00947" />
+-      <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="2.88.1" />
++      <PackageReference Include="Newtonsoft.Json" Version="13.0.4" />
++      <PackageReference Include="Serilog" Version="4.3.1" />
++      <PackageReference Include="Serilog.Extensions.Logging" Version="10.0.0" />
++      <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
++      <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="2.88.9" />
+     </ItemGroup>
+ 
+     <ItemGroup>
+--- a/BlenderUmap/Export/Actor.cs
++++ b/BlenderUmap/Export/Actor.cs
+@@ -1,4 +1,4 @@
+-﻿using CUE4Parse.UE4.Assets.Exports;
++using CUE4Parse.UE4.Assets.Exports;
+ using CUE4Parse.UE4.Assets.Readers;
+ using CUE4Parse.UE4.Versions;
+ 
+@@ -8,7 +8,7 @@
+     public string ActorLabel = "None";
+     public override void Deserialize(FAssetArchive Ar, long validPos) {
+         base.Deserialize(Ar, validPos);
+-        if (FUE5PrivateFrostyStreamObjectVersion.Get(Ar) >= FUE5PrivateFrostyStreamObjectVersion.Type.SerializeActorLabelInCookedBuilds)
++        if (FUE5SpecialProjectStreamObjectVersion.Get(Ar) >= FUE5SpecialProjectStreamObjectVersion.Type.SerializeActorLabelInCookedBuilds)
+         {
+             if (Ar.ReadBoolean()) {
+                 ActorLabel = Ar.ReadFString();
+--- /dev/null
++++ b/BlenderUmap/Extensions/ModernReplayReader.cs
+@@ -0,0 +1,121 @@
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using Newtonsoft.Json;
++using Microsoft.Extensions.Logging;
++using Unreal.Core;
++using Unreal.Core.Extensions;
++using Unreal.Core.Models;
++using Unreal.Core.Models.Enums;
++
++namespace BlenderUmap.Extensions;
++
++// Retain full package paths; the statistics reader otherwise keeps only short names.
++public sealed class ModernReplayReader : FortniteReplayReader.ReplayReader
++{
++    private readonly Dictionary<uint, (uint Outer, string Name)> paths = new();
++    public readonly Dictionary<uint, ReplayActor> Actors = new();
++    public readonly ReplayDiagnostics Diagnostics;
++
++    public ModernReplayReader() : this(new ReplayDiagnostics()) { }
++    private ModernReplayReader(ReplayDiagnostics diagnostics) : base(diagnostics, ParseMode.Minimal)
++    {
++        Diagnostics = diagnostics;
++    }
++
++    public override NetworkGUID InternalLoadObject(FArchive archive, bool exporting, int depth = 0)
++    {
++        if (depth > 16) throw new InvalidDataException("Replay object path recursion exceeded 16.");
++        var guid = new NetworkGUID { Value = archive.ReadIntPacked() };
++        if (!guid.IsValid()) return guid;
++        if (guid.IsDefault() || exporting)
++        {
++            var flags = archive.ReadByteAsEnum<ExportFlags>();
++            if (flags.HasFlag(ExportFlags.bHasPath))
++            {
++                var outer = InternalLoadObject(archive, true, depth + 1);
++                var name = archive.ReadFString();
++                if (flags.HasFlag(ExportFlags.bHasNetworkChecksum)) archive.ReadUInt32();
++                paths[guid.Value] = (outer.Value, name);
++                if (exporting) _netGuidCache.NetGuidToPathName[guid.Value] = name.RemoveAllPathPrefixes();
++            }
++        }
++        return guid;
++    }
++
++    private string Resolve(uint id, int depth = 0)
++    {
++        if (depth > 16 || !paths.TryGetValue(id, out var entry)) return null;
++        if (entry.Name.StartsWith("/")) return entry.Name;
++        var parent = Resolve(entry.Outer, depth + 1);
++        return parent is null ? null : parent + "." + entry.Name;
++    }
++
++    protected override void OnChannelOpened(uint index, NetworkGUID guid)
++    {
++        var actor = Channels[index]?.Actor;
++        if (actor != null)
++            Actors[actor.ActorNetGUID.Value] = new ReplayActor(this, actor);
++        base.OnChannelOpened(index, guid);
++    }
++
++    // Keep every observed actor even when its replication channel closes.
++    public sealed class ReplayActor(ModernReplayReader reader, Actor actor)
++    {
++        public uint Id => actor.ActorNetGUID.Value;
++        public string Level => reader.Resolve(actor.Level?.Value ?? 0);
++        public string GetObject()
++        {
++            var path = reader.Resolve(actor.Archetype?.Value ?? 0);
++            if (path is null) return null;
++            return path.Replace(".Default__", ".");
++        }
++        public FVector Location => actor.Location;
++        public FRotator Rotation => actor.Rotation;
++        public FVector Scale => actor.Scale;
++        public bool HasTransform => Location is not null && Rotation is not null && Scale is not null;
++    }
++
++    public object Describe(FortniteReplayReader.Models.FortniteReplay replay) => new
++    {
++        Status = "Replay parsed; complete map export and Fortnite 42.20 compatibility are not established.",
++        FortniteBranch = replay.Header.Branch,
++        EngineVersion = $"{replay.Header.Major}.{replay.Header.Minor}.{replay.Header.Patch}",
++        EngineNetworkVersion = (uint)replay.Header.EngineNetworkVersion,
++        Levels = replay.Header.LevelNamesAndTimes.Select(x => new { Name = x.Item1, Time = x.Item2 }),
++        ObservedActors = Actors.Count,
++        ActorsWithSpawnTransform = Actors.Values.Count(x => x.HasTransform),
++        ActorsWithResolvedArchetype = Actors.Values.Count(x => x.GetObject() != null),
++        WarningCount = Diagnostics.WarningCount,
++        ErrorCount = Diagnostics.ErrorCount,
++        FirstMessages = Diagnostics.FirstMessages,
++        ObjectPaths = Actors.Values.Select(x => x.GetObject()).Where(x => x != null).Distinct().OrderBy(x => x)
++    };
++
++    public static int Inspect(string input, string output)
++    {
++        var reader = new ModernReplayReader();
++        using var stream = File.OpenRead(input);
++        var replay = reader.ReadReplay(stream);
++        var json = JsonConvert.SerializeObject(reader.Describe(replay), Formatting.Indented);
++        if (output != null) File.WriteAllText(output, json);
++        Console.WriteLine(json);
++        return reader.Diagnostics.ErrorCount == 0 && reader.Actors.Count > 0 ? 0 : 2;
++    }
++}
++
++public sealed class ReplayDiagnostics : ILogger
++{
++    public int WarningCount;
++    public int ErrorCount;
++    public readonly List<string> FirstMessages = new();
++    public IDisposable BeginScope<TState>(TState state) where TState : notnull => null;
++    public bool IsEnabled(LogLevel level) => level >= LogLevel.Warning;
++    public void Log<TState>(LogLevel level, EventId id, TState state, Exception error, Func<TState, Exception, string> formatter)
++    {
++        if (!IsEnabled(level)) return;
++        if (level >= LogLevel.Error) ErrorCount++; else WarningCount++;
++        if (FirstMessages.Count < 8) FirstMessages.Add(formatter(state, error));
++    }
++}
+--- a/BlenderUmap/Extensions/ReplayExporter.cs
++++ b/BlenderUmap/Extensions/ReplayExporter.cs
+@@ -1,4 +1,4 @@
+-﻿using System;
++using System;
+ using System.Collections.Generic;
+ using System.IO;
+ using System.Linq;
+@@ -23,24 +23,16 @@
+ namespace BlenderUmap.Extensions;
+ 
+ public class NullPackage : AbstractUePackage {
+-    public NullPackage(string name, IFileProvider provider, TypeMappings mappings) : base(name, provider, mappings) {
+-    }
+-
+-    public override FPackageFileSummary Summary => throw new NotImplementedException();
+-
+-    public override FNameEntrySerialized[] NameMap => throw new NotImplementedException();
+-
+-    public override Lazy<UObject>[] ExportsLazy => throw new NotImplementedException();
+-
+-    public override bool IsFullyLoaded => throw new NotImplementedException();
+-
+-    public override UObject GetExportOrNull(string name, StringComparison comparisonType = StringComparison.Ordinal) {
+-        throw new NotImplementedException();
+-    }
+-
+-    public override ResolvedObject ResolvePackageIndex(FPackageIndex index) {
+-        throw new NotImplementedException();
+-    }
++    public NullPackage(string name, IFileProvider provider, TypeMappings mappings) : base(name, provider) {
++        ExportsLazy = Array.Empty<Lazy<UObject>>();
++        IsFullyLoaded = true;
++    }
++    public override FPackageFileSummary Summary => throw new NotSupportedException();
++    public override FNameEntrySerialized[] NameMap => Array.Empty<FNameEntrySerialized>();
++    public override int ImportMapLength => 0;
++    public override int ExportMapLength => 0;
++    public override int GetExportIndex(string name, StringComparison comparisonType = StringComparison.Ordinal) => -1;
++    public override ResolvedObject ResolvePackageIndex(FPackageIndex index) => null;
+ }
+ 
+ public class ReplayExporter
+@@ -48,10 +40,12 @@
+     public static IPackage ExportAndProduceProcessed(string obj, MyFileProvider provider) {
+             var comps = new JArray();
+ 
+-            var rr = new ReplayReader(null, ParseMode.Full); //new Logger<ReplayExporter>(new SerilogLoggerFactory())
++            var rr = new ModernReplayReader(); //new Logger<ReplayExporter>(new SerilogLoggerFactory())
+ 
+             try {
+-                var replay = rr.ReadReplay(File.OpenRead(obj));
++                using var input = File.OpenRead(obj);
++                var replay = rr.ReadReplay(input);
++                Log.Information("Replay: {0}", JsonConvert.SerializeObject(rr.Describe(replay)));
+             }
+             catch (Exception e) {
+                 throw new ParserException("corrupted or unsupported replay file", e);
+@@ -60,7 +54,7 @@
+             var lights = new List<LightInfo2>();
+ 
+             // var channels = rr.Channels.ToList().FindAll(x => x != null).ToArray();
+-            var actors = rr.Builder._actor_actors.Values.ToArray();
++            var actors = rr.Actors.Values.ToArray();
+             for (var index = 0; index < actors.Length; index++)
+             {
+                 if (index % 100 == 0) { // every 100th actor
+@@ -73,6 +67,7 @@
+                 //     continue;
+                 //
+                 var actor = actors[index];
++                if (!actor.HasTransform) continue;
+                 UObject record = null;
+                 // if (provider.TryLoadPackage(actor.GetObject(), out var pkg_)) {
+                 //     record = pkg_.GetExportOrNull("")
+@@ -184,7 +179,8 @@
+                 comp.Add(LightIndex);
+             }
+ 
+-            string pkgName = "Replay\\" + obj.SubstringAfterLast("\\");
++            if (comps.Count == 0) throw new InvalidDataException("No mesh actors exported. The replay alone does not contain meshes; check the matching game files and mappings.");
++            string pkgName = "Replay/" + Path.GetFileName(obj);
+             var file = new FileInfo(Path.Combine(MyFileProvider.JSONS_FOLDER.ToString(), pkgName + ".processed.json"));
+             file.Directory?.Create();
+             Log.Information("Writing to {0}", file.FullName);
+--- a/BlenderUmap/MyFileProvider.cs
++++ b/BlenderUmap/MyFileProvider.cs
+@@ -1,4 +1,4 @@
+-﻿using System;
++using System;
+ using System.Collections.Concurrent;
+ using System.Collections.Generic;
+ using System.Globalization;
+@@ -19,6 +19,7 @@
+ using CUE4Parse.UE4.Versions;
+ using CUE4Parse.Utils;
+ using Newtonsoft.Json;
++using Serilog;
+ 
+ namespace BlenderUmap {
+     public class MyFileProvider : DefaultFileProvider {
+@@ -26,7 +27,7 @@
+         private readonly Cache _cache;
+         private readonly bool _bDumpAssets;
+ 
+-        public MyFileProvider(string folder, VersionContainer version, List<EncryptionKey> encryptionKeys, bool bDumpAssets, int cacheSize) : base(folder, SearchOption.AllDirectories, true, version) {
++        public MyFileProvider(string folder, VersionContainer version, List<EncryptionKey> encryptionKeys, bool bDumpAssets, int cacheSize) : base(folder, SearchOption.AllDirectories, version, StringComparer.OrdinalIgnoreCase) {
+             _cache = new Cache(cacheSize);
+             _bDumpAssets = bDumpAssets;
+ 
+@@ -50,7 +51,7 @@
+             Log.Information("Successfully mounted {0} containers", mounted);
+         }
+ 
+-        public override bool TryLoadPackage(string path, out IPackage package) {
++        public new bool TryLoadPackage(string path, out IPackage package) {
+             if (_cache.TryGet(path, out package))
+                 return true;
+             else {
+@@ -65,26 +66,7 @@
+             return false;
+         }
+         
+-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+-        public override bool TryLoadObject(string? objectPath, out UObject export)
+-        {
+-            export = TryLoadObjectAsync(objectPath).Result;
+-            return export != null;
+-        }
+-
+-        public override async Task<IPackage?> TryLoadPackageAsync(string path)
+-        {
+-            if (!TryFindGameFile(path, out var file))
+-            {
+-                return null;
+-            }
+-
+-            if (TryLoadPackage(path, out var package)) {
+-                return package;
+-            }
+-
+-            return await TryLoadPackageAsync(file).ConfigureAwait(false);
+-        }
++        public bool TryLoadObject(string objectPath, out UObject export) => base.TryLoadPackageObject<UObject>(objectPath, out export);
+ 
+         public void DumpJson(IPackage package) {
+             var output = new FileInfo(Path.Combine(Program.GetExportDir(package).ToString(), package.Name.SubstringAfterLast("/") + ".json"));
+--- a/Importers/Blender/main.py
++++ b/Importers/Blender/main.py
+@@ -49,10 +49,10 @@
+             cmd = []
+ 
+         env_vars = os.environ.copy()
+-        env_vars["PATH"] = f"{sc.exportPath};" + env_vars["PATH"]
++        env_vars["PATH"] = sc.exportPath + os.pathsep + env_vars["PATH"]
+ 
+         subprocess.run(
+-            cmd,
++            [executable],
+             executable=executable,
+             capture_output=False,
+             shell=False,
+@@ -168,6 +168,13 @@
+         ("GAME_UE5_0", "GAME_UE5_0", ""),
+         ("GAME_UE5_1", "GAME_UE5_1", ""),
+         ("GAME_UE5_2", "GAME_UE5_2", ""),
++        ("GAME_UE5_3", "GAME_UE5_3", ""),
++        ("GAME_UE5_4", "GAME_UE5_4", ""),
++        ("GAME_UE5_5", "GAME_UE5_5", ""),
++        ("GAME_UE5_6", "GAME_UE5_6", ""),
++        ("GAME_UE5_7", "GAME_UE5_7", ""),
++        ("GAME_UE5_8", "GAME_UE5_8", ""),
++        ("GAME_UE5_9", "GAME_UE5_9", ""),
+     )
+ 
+ @register_class
+--- a/Importers/Blender/psk/reader.py
++++ b/Importers/Blender/psk/reader.py
+@@ -166,7 +166,8 @@
+         for vertex_normal in psk.vertex_normals:
+             normals.append(tuple(vertex_normal))
+         mesh_data.normals_split_custom_set_from_vertices(normals)
+-        mesh_data.use_auto_smooth = True
++        if hasattr(mesh_data, "use_auto_smooth"):
++            mesh_data.use_auto_smooth = True
+ 
+     bm.normal_update()
+     bm.free()
