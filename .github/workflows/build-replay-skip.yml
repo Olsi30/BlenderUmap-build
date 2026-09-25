@@ -1,0 +1,104 @@
+name: Build BlenderUmap Replay SkipBadActors
+
+on:
+  push:
+    paths:
+      - ".github/workflows/build-replay-skip.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 6
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "6.0.x"
+
+      - name: Clone BlenderUmap2
+        run: |
+          git clone --recursive https://github.com/MinshuG/BlenderUmap2.git source
+          cd source
+          git checkout 87ae84e70f706356945c8152a407108262a41897
+          git submodule update --init --recursive
+
+      - name: Patch UE6 FField and skip bad replay actors
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          f = Path("source/CUE4Parse/CUE4Parse/UE4/Objects/UObject/FField.cs")
+          s = f.read_text(encoding="utf-8-sig")
+          old = """        public virtual void Deserialize(FAssetArchive Ar)
+        {
+            Name = Ar.ReadFName();
+            Flags = Ar.Read<uint>();
+        }"""
+          new = """        public virtual void Deserialize(FAssetArchive Ar)
+        {
+            Name = Ar.ReadFName();
+            // UE5.8+/UE6 filtered-editor packages no longer serialize FField flags.
+            // 0x05080000 and 0x06000000 use the current CUE4Parse numeric layout;
+            // custom UE6 config supplied by Blender uses 0x06000000.
+            if ((int) Ar.Game < 0x05080000 || !Ar.IsFilterEditorOnly)
+            {
+                Flags = Ar.Read<uint>();
+            }
+        }"""
+          if old not in s:
+              raise SystemExit("FField patch target not found")
+          f.write_text(s.replace(old, new), encoding="utf-8")
+
+          r = Path("source/BlenderUmap/Extensions/ReplayExporter.cs")
+          s = r.read_text(encoding="utf-8-sig")
+          old = """                if ((actor.GetObject() == null || !provider.TryLoadObject(actor.GetObject(), out record)))
+                    continue;"""
+          new = """                var actorObjectPath = actor.GetObject();
+                if (actorObjectPath == null)
+                    continue;
+
+                try {
+                    if (!provider.TryLoadObject(actorObjectPath, out record))
+                        continue;
+                }
+                catch (Exception e) {
+                    Log.Warning("Skipping replay actor {0} because its asset could not be parsed: {1}", actorObjectPath, e.Message);
+                    continue;
+                }"""
+          if old not in s:
+              raise SystemExit("ReplayExporter patch target not found")
+          r.write_text(s.replace(old, new), encoding="utf-8")
+          PY
+
+      - name: Publish Windows exporter
+        run: |
+          cd source
+          dotnet publish BlenderUmap -c Release -r win-x64 --no-self-contained -o ./BlenderUmap/bin/Publish/ -p:PublishSingleFile=true -p:DebugType=None -p:DebugSymbols=false -p:IncludeAllContentForSelfExtract=true
+
+      - name: Package Blender addon
+        run: |
+          cd source
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile
+
+          out = Path("../BlenderUmap-21.8-Fortnite42.20-UE6-SkipBadActors-win-x64.zip")
+          with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+              pub = Path("BlenderUmap/bin/Publish")
+              for p in pub.rglob("*"):
+                  if p.is_file():
+                      z.write(p, Path("BlenderUmap") / p.relative_to(pub))
+              imp = Path("Importers/Blender")
+              for p in imp.rglob("*.py"):
+                  z.write(p, Path("BlenderUmap") / p.relative_to(imp))
+              z.writestr("BlenderUmap/__version__.py", "__version__ = '21.8-ue6-skipbadactors'\nbranch = 'custom'\n")
+          print(out)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlenderUmap-UE6-SkipBadActors
+          path: BlenderUmap-21.8-Fortnite42.20-UE6-SkipBadActors-win-x64.zip
+          if-no-files-found: error
