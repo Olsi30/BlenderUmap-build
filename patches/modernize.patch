@@ -390,14 +390,15 @@
 +            .OrderBy(x => x.GetObject())
 +            .ThenBy(x => x.Id)
 +            .Select(x => new {
-+                x.Id,
-+                x.Level,
++                Id = x.Id,
++                Level = x.Level,
 +                ObjectPath = x.GetObject(),
-+                x.HasTransform,
-+                x.Location,
-+                x.Rotation,
-+                x.Scale
++                HasTransform = x.HasTransform,
++                Location = x.Location,
++                Rotation = x.Rotation,
++                Scale = x.Scale
 +            })
++            .ToArray()
 +    };
 +
 +    public static int Inspect(string input, string output)
