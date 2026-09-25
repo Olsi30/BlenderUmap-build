@@ -384,7 +384,20 @@
 +        WarningCount = Diagnostics.WarningCount,
 +        ErrorCount = Diagnostics.ErrorCount,
 +        FirstMessages = Diagnostics.FirstMessages,
-+        ObjectPaths = Actors.Values.Select(x => x.GetObject()).Where(x => x != null).Distinct().OrderBy(x => x)
++        ObjectPaths = Actors.Values.Select(x => x.GetObject()).Where(x => x != null).Distinct().OrderBy(x => x),
++        ActorRecords = Actors.Values
++            .Where(x => x.GetObject() != null)
++            .OrderBy(x => x.GetObject())
++            .ThenBy(x => x.Id)
++            .Select(x => new {
++                x.Id,
++                x.Level,
++                ObjectPath = x.GetObject(),
++                x.HasTransform,
++                x.Location,
++                x.Rotation,
++                x.Scale
++            })
 +    };
 +
 +    public static int Inspect(string input, string output)
