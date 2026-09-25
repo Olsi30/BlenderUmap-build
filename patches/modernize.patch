@@ -291,7 +291,7 @@
                  ActorLabel = Ar.ReadFString();
 --- /dev/null
 +++ b/BlenderUmap/Extensions/ModernReplayReader.cs
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,135 @@
 +using System;
 +using System.Collections.Generic;
 +using System.IO;
