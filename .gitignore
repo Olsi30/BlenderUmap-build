@@ -1,0 +1,8 @@
+.work/
+release/
+__pycache__/
+*.replay
+*.usmap
+config.json
+Logs/
+

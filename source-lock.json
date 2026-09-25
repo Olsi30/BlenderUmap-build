@@ -1,0 +1,21 @@
+{
+  "version": "0.1.0-experimental",
+  "sources": [
+    {
+      "directory": "source",
+      "url": "https://github.com/MinshuG/BlenderUmap2.git",
+      "commit": "87ae84e70f706356945c8152a407108262a41897"
+    },
+    {
+      "directory": "source/CUE4Parse",
+      "url": "https://github.com/FabianFG/CUE4Parse.git",
+      "commit": "cb72c6e181687bc9b748ba09928677763057dd3a"
+    },
+    {
+      "directory": "source/FortniteReplayDecompressor",
+      "url": "https://github.com/Shiqan/FortniteReplayDecompressor.git",
+      "commit": "76f74c1f640069afdba71b6468e2f819327893c2"
+    }
+  ]
+}
+

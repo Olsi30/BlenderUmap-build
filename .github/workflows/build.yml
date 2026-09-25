@@ -1,0 +1,31 @@
+name: Build experimental Windows add-on
+on:
+  push:
+    branches: [main, codex/modern-replay-build]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: blenderumap-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout build project
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        with:
+          dotnet-version: 10.0.x
+      - name: Build and smoke-test Windows ZIP
+        run: python build.py --rid win-x64
+      - name: Upload installable add-on
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: BlenderUmap-experimental-win-x64
+          path: release/*
+          if-no-files-found: error
+          retention-days: 30
+
